@@ -10,12 +10,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lxn/walk"
-	. "github.com/lxn/walk/declarative"
-	"github.com/lxn/win"
+	"github.com/tailscale/walk"
+	. "github.com/tailscale/walk/declarative"
+	"github.com/tailscale/win"
 )
 
 func main() {
+	app, err := walk.InitApp()
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	var mw *walk.MainWindow
 	var lb *walk.ListBox
 	var items []logEntry
@@ -84,7 +89,7 @@ func main() {
 	}()
 
 	mw.Show()
-	mw.Run()
+	app.Run()
 
 	cancel <- true
 }

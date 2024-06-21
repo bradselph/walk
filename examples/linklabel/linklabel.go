@@ -6,28 +6,34 @@ package main
 
 import (
 	"log"
-)
 
-import (
-	"github.com/lxn/walk"
-	. "github.com/lxn/walk/declarative"
+	"github.com/tailscale/walk"
+
+	. "github.com/tailscale/walk/declarative"
 )
 
 func main() {
-	if _, err := (MainWindow{
+	app, err := walk.InitApp()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err := (MainWindow{
 		Title:   "Walk LinkLabel Example",
 		MinSize: Size{300, 200},
 		Layout:  VBox{},
 		Children: []Widget{
 			LinkLabel{
 				MaxSize: Size{100, 0},
-				Text:    `I can contain multiple links like <a id="this" href="https://golang.org">this</a> or <a id="that" href="https://github.com/lxn/walk">that one</a>.`,
+				Text:    `I can contain multiple links like <a id="this" href="https://golang.org">this</a> or <a id="that" href="https://github.com/tailscale/walk">that one</a>.`,
 				OnLinkActivated: func(link *walk.LinkLabelLink) {
 					log.Printf("id: '%s', url: '%s'\n", link.Id(), link.URL())
 				},
 			},
 		},
-	}).Run(); err != nil {
+	}).Create(); err != nil {
 		log.Fatal(err)
 	}
+
+	app.Run()
 }

@@ -7,11 +7,16 @@ package main
 import (
 	"log"
 
-	"github.com/lxn/walk"
-	. "github.com/lxn/walk/declarative"
+	"github.com/tailscale/walk"
+	. "github.com/tailscale/walk/declarative"
 )
 
 func main() {
+	app, err := walk.InitApp()
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	var slv, slh *walk.Slider
 	var maxEdit, minEdit, valueEdit *walk.NumberEdit
 
@@ -91,5 +96,7 @@ func main() {
 				},
 			},
 		},
-	}.Run()
+	}.Create()
+
+	app.Run()
 }

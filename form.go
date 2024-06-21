@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build windows
 // +build windows
 
 package walk
@@ -11,10 +12,9 @@ import (
 	"math"
 	"sync"
 	"syscall"
-	"time"
 	"unsafe"
 
-	"github.com/lxn/win"
+	"github.com/tailscale/win"
 )
 
 type CloseReason byte
@@ -30,23 +30,20 @@ var (
 		funcs []func()
 	}
 
-	syncMsgId                 uint32
 	taskbarButtonCreatedMsgId uint32
-	taskbarCreatedMsgId       uint32
+
+	activeForm *FormBase
 )
 
 func init() {
 	AppendToWalkInit(func() {
-		syncMsgId = win.RegisterWindowMessage(syscall.StringToUTF16Ptr("WalkSync"))
 		taskbarButtonCreatedMsgId = win.RegisterWindowMessage(syscall.StringToUTF16Ptr("TaskbarButtonCreated"))
-		taskbarCreatedMsgId = win.RegisterWindowMessage(syscall.StringToUTF16Ptr("TaskbarCreated"))
 	})
 }
 
 type Form interface {
 	Container
 	AsFormBase() *FormBase
-	Run() int
 	Starting() *Event
 	Closing() *CloseEvent
 	Activating() *Event
@@ -78,7 +75,6 @@ type FormBase struct {
 	clientComposite             *Composite
 	owner                       Form
 	stopwatch                   *stopwatch
-	inProgressEventCount        int
 	performLayout               chan ContainerLayoutItem
 	layoutResults               chan []LayoutResult
 	inSizeLoop                  chan bool
@@ -149,11 +145,40 @@ func (fb *FormBase) init(form Form) error {
 
 	fb.performLayout, fb.layoutResults, fb.inSizeLoop, fb.updateStopwatch, fb.quitLayoutPerformer = startLayoutPerformer(fb)
 
+	if fb.owner != nil {
+		invalidateDescendentBorders := func() {
+			walkDescendants(fb.owner, func(wnd Window) bool {
+				if widget, ok := wnd.(Widget); ok {
+					widget.AsWidgetBase().invalidateBorderInParent()
+				}
+
+				return true
+			})
+		}
+
+		invalidateDescendentBorders()
+		defer invalidateDescendentBorders()
+	}
+
+	fb.started = true
+	fb.startingPublisher.Publish()
+
+	fb.SetBoundsPixels(fb.BoundsPixels())
+
+	if fb.proposedSize == (Size{}) {
+		fb.proposedSize = maxSize(SizeFrom96DPI(fb.minSize96dpi, fb.DPI()), fb.SizePixels())
+		if !fb.Suspended() {
+			fb.startLayout()
+		}
+	}
+
+	fb.SetSuspended(false)
+
 	return nil
 }
 
 func (fb *FormBase) Dispose() {
-	if fb.hWnd != 0 {
+	if fb.hWnd != 0 && fb.quitLayoutPerformer != nil {
 		fb.quitLayoutPerformer <- struct{}{}
 	}
 
@@ -340,42 +365,7 @@ func (fb *FormBase) SetRightToLeftLayout(rtl bool) error {
 	return fb.ensureExtendedStyleBits(win.WS_EX_LAYOUTRTL, rtl)
 }
 
-func (fb *FormBase) Run() int {
-	if fb.owner != nil {
-		win.EnableWindow(fb.owner.Handle(), false)
-
-		invalidateDescendentBorders := func() {
-			walkDescendants(fb.owner, func(wnd Window) bool {
-				if widget, ok := wnd.(Widget); ok {
-					widget.AsWidgetBase().invalidateBorderInParent()
-				}
-
-				return true
-			})
-		}
-
-		invalidateDescendentBorders()
-		defer invalidateDescendentBorders()
-	}
-
-	fb.started = true
-	fb.startingPublisher.Publish()
-
-	fb.SetBoundsPixels(fb.BoundsPixels())
-
-	if fb.proposedSize == (Size{}) {
-		fb.proposedSize = maxSize(SizeFrom96DPI(fb.minSize96dpi, fb.DPI()), fb.SizePixels())
-		if !fb.Suspended() {
-			fb.startLayout()
-		}
-	}
-
-	fb.SetSuspended(false)
-
-	return fb.mainLoop()
-}
-
-func (fb *FormBase) handleKeyDown(msg *win.MSG) bool {
+func (fb *FormBase) HandleKeyDown(msg *win.MSG) bool {
 	ret := false
 
 	key, mods := Key(msg.WParam), ModifiersDown()
@@ -512,6 +502,10 @@ func (fb *FormBase) SetOwner(value Form) error {
 	return nil
 }
 
+func (fb *FormBase) OwnerWindow() Window {
+	return fb.owner
+}
+
 func (fb *FormBase) Icon() Image {
 	return fb.icon
 }
@@ -566,16 +560,6 @@ func (fb *FormBase) Show() {
 	}
 
 	fb.window.SetVisible(true)
-}
-
-func (fb *FormBase) close() error {
-	if p, ok := fb.window.(Persistable); ok && p.Persistent() && App().Settings() != nil {
-		p.SaveState()
-	}
-
-	fb.window.Dispose()
-
-	return nil
 }
 
 func (fb *FormBase) Close() error {
@@ -714,14 +698,14 @@ func (fb *FormBase) WndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) u
 				win.SetFocus(fb.prevFocusHWnd)
 			}
 
-			fb.group.SetActiveForm(fb.window.(Form))
+			activeForm = fb
 
 			fb.activatingPublisher.Publish()
 
 		case win.WA_INACTIVE:
 			fb.prevFocusHWnd = win.GetFocus()
 
-			fb.group.SetActiveForm(nil)
+			activeForm = nil
 
 			fb.deactivatingPublisher.Publish()
 		}
@@ -733,14 +717,10 @@ func (fb *FormBase) WndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) u
 		var canceled bool
 		fb.closingPublisher.Publish(&canceled, fb.closeReason)
 		if !canceled {
-			if fb.owner != nil {
-				win.EnableWindow(fb.owner.Handle(), true)
-				if !win.SetWindowPos(fb.owner.Handle(), win.HWND_NOTOPMOST, 0, 0, 0, 0, win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_SHOWWINDOW) {
-					lastError("SetWindowPos")
-				}
+			if p, ok := fb.window.(Persistable); ok && p.Persistent() && App().Settings() != nil {
+				p.SaveState()
 			}
-
-			fb.close()
+			fb.started = false
 		}
 		return 0
 
@@ -855,21 +835,6 @@ func (fb *FormBase) WndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) u
 
 		fb.SetIcon(fb.icon)
 
-		time.AfterFunc(time.Second, func() {
-			if fb.hWnd == 0 {
-				return
-			}
-			fb.Synchronize(func() {
-				for ni := range notifyIcons {
-					// We do this on all NotifyIcons, not just ones attached to this form or descendents, because
-					// the notify icon might be on a different screen, and since it can't get notifications itself
-					// we hope that one of the forms did for it. We also have to delay it by a second, because the
-					// tray usually gets resized sometime after us. This is a nasty hack!
-					ni.applyDPI()
-				}
-			})
-		})
-
 	case win.WM_SYSCOMMAND:
 		if wParam == win.SC_CLOSE {
 			fb.closeReason = CloseReasonUser
@@ -883,12 +848,31 @@ func (fb *FormBase) WndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) u
 		if fb.progressIndicator == nil && (major > 6 || (major == 6 && minor > 0)) {
 			fb.progressIndicator, _ = newTaskbarList3(fb.hWnd)
 		}
-
-	case taskbarCreatedMsgId:
-		for ni := range notifyIcons {
-			ni.readdToTaskbar()
-		}
 	}
 
 	return fb.WindowBase.WndProc(hwnd, msg, wParam, lParam)
+}
+
+func (fb *FormBase) EnterMode() {
+}
+
+func (fb *FormBase) Running() bool {
+	return fb.started
+}
+
+func (fb *FormBase) OnPreTranslate(msg *win.MSG) bool {
+	return DefaultModalPreTranslate(fb, msg)
+}
+
+func (fb *FormBase) OnPostDispatch() {
+	if !fb.layoutScheduled {
+		return
+	}
+
+	fb.layoutScheduled = false
+	fb.startLayout()
+}
+
+func (fb *FormBase) Window() Window {
+	return fb.window
 }

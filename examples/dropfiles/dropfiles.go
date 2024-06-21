@@ -5,13 +5,19 @@
 package main
 
 import (
+	"log"
 	"strings"
 
-	"github.com/lxn/walk"
-	. "github.com/lxn/walk/declarative"
+	"github.com/tailscale/walk"
+	. "github.com/tailscale/walk/declarative"
 )
 
 func main() {
+	app, err := walk.InitApp()
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	var textEdit *walk.TextEdit
 	MainWindow{
 		Title:   "Walk DropFiles Example",
@@ -27,5 +33,7 @@ func main() {
 				Text:     "Drop files here, from windows explorer...",
 			},
 		},
-	}.Run()
+	}.Create()
+
+	app.Run()
 }

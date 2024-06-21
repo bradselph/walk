@@ -12,7 +12,7 @@ import (
 )
 
 import (
-	"github.com/lxn/win"
+	"github.com/tailscale/win"
 )
 
 type MsgBoxStyle uint
@@ -50,6 +50,9 @@ const (
 	MsgBoxServiceNotification MsgBoxStyle = win.MB_SERVICE_NOTIFICATION
 )
 
+// MsgBox shows a simple modal dialog box.
+//
+// Deprecated: Use TaskDialog instead.
 func MsgBox(owner Form, title, message string, style MsgBoxStyle) int {
 	var ownerHWnd win.HWND
 

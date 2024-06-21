@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build windows
 // +build windows
 
 package walk
@@ -11,57 +12,107 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/lxn/win"
+	"github.com/tailscale/win"
 )
 
 type Menu struct {
-	hMenu   win.HMENU
-	window  Window
-	actions *ActionList
-	getDPI  func() int
+	hMenu                      win.HMENU
+	window                     Window
+	actions                    *ActionList
+	getDPI                     func() int
+	initPopupPublisher         EventPublisher
+	sharedMetrics              *menuSharedMetrics  // shared theme metrics across all menus associated with the current window
+	perMenuMetrics             menuSpecificMetrics // per-menu metrics
+	allowOwnerDrawInvalidation bool
 }
 
-func newMenuBar(window Window) (*Menu, error) {
+func newMenuBar(window Window) (menu *Menu, _ error) {
 	hMenu := win.CreateMenu()
 	if hMenu == 0 {
 		return nil, lastError("CreateMenu")
 	}
+	defer func() {
+		if menu == nil {
+			win.DestroyMenu(hMenu)
+		}
+	}()
 
 	m := &Menu{
 		hMenu:  hMenu,
 		window: window,
 	}
-	m.actions = newActionList(m)
 
-	return m, nil
+	// For resolveMenu to work, we must set DwMenuData to m.
+	mi := win.MENUINFO{
+		FMask:      win.MIM_MENUDATA,
+		DwMenuData: uintptr(unsafe.Pointer(m)),
+	}
+	mi.CbSize = uint32(unsafe.Sizeof(mi))
+
+	if !win.SetMenuInfo(hMenu, &mi) {
+		return nil, lastError("SetMenuInfo")
+	}
+
+	m.actions = newActionList(m)
+	menu = m
+
+	return menu, nil
 }
 
-func NewMenu() (*Menu, error) {
+func NewMenu() (menu *Menu, _ error) {
 	hMenu := win.CreatePopupMenu()
 	if hMenu == 0 {
 		return nil, lastError("CreatePopupMenu")
 	}
+	defer func() {
+		if menu == nil {
+			win.DestroyMenu(hMenu)
+		}
+	}()
 
-	var mi win.MENUINFO
+	mi := win.MENUINFO{FMask: win.MIM_STYLE}
 	mi.CbSize = uint32(unsafe.Sizeof(mi))
 
 	if !win.GetMenuInfo(hMenu, &mi) {
 		return nil, lastError("GetMenuInfo")
 	}
 
-	mi.FMask |= win.MIM_STYLE
-	mi.DwStyle = win.MNS_CHECKORBMP
+	mi.DwStyle |= win.MNS_CHECKORBMP
+	mi.DwStyle &= ^uint32(win.MNS_NOCHECK)
+
+	m := &Menu{
+		hMenu: hMenu,
+	}
+
+	// For resolveMenu to work, we must set DwMenuData to m.
+	mi.FMask |= win.MIM_MENUDATA
+	mi.DwMenuData = uintptr(unsafe.Pointer(m))
 
 	if !win.SetMenuInfo(hMenu, &mi) {
 		return nil, lastError("SetMenuInfo")
 	}
 
-	m := &Menu{
-		hMenu: hMenu,
-	}
 	m.actions = newActionList(m)
+	menu = m
 
-	return m, nil
+	return menu, nil
+}
+
+// resolveMenu resolves a Walk Menu from an hmenu.
+func resolveMenu(hmenu win.HMENU) *Menu {
+	mi := win.MENUINFO{FMask: win.MIM_MENUDATA}
+	mi.CbSize = uint32(unsafe.Sizeof(mi))
+	if !win.GetMenuInfo(hmenu, &mi) {
+		return nil
+	}
+
+	return (*Menu)(unsafe.Pointer(mi.DwMenuData))
+}
+
+// InitPopup returns the event that is published when m is about to be displayed
+// as a popup menu.
+func (m *Menu) InitPopup() *Event {
+	return m.initPopupPublisher.Event()
 }
 
 func (m *Menu) Dispose() {
@@ -77,11 +128,23 @@ func (m *Menu) IsDisposed() bool {
 	return m.hMenu == 0
 }
 
+// onInitPopup is invoked whenever m is about to be displayed as a popup menu.
+// window specifies the parent Window for which the menu is to be shown.
+func (m *Menu) onInitPopup(window Window) {
+	m.allowOwnerDrawInvalidation = true
+	defer func() {
+		m.allowOwnerDrawInvalidation = false
+	}()
+	m.initPopupPublisher.Publish()
+	m.perMenuMetrics.reset()
+	m.updateItemsForWindow(window)
+}
+
 func (m *Menu) Actions() *ActionList {
 	return m.actions
 }
 
-func (m *Menu) updateItemsWithImageForWindow(window Window) {
+func (m *Menu) updateItemsForWindow(window Window) {
 	if m.window == nil {
 		m.window = window
 		defer func() {
@@ -89,37 +152,101 @@ func (m *Menu) updateItemsWithImageForWindow(window Window) {
 		}()
 	}
 
+	var needAccelSpace bool
+	var numOwnerDraw int
+	var sm *menuSharedMetrics
+
 	for _, action := range m.actions.actions {
-		if action.image != nil {
+		needAccelSpace = needAccelSpace || action.shortcut.Key != 0
+		switch {
+		case action.ownerDrawInfo != nil:
+			if numOwnerDraw == 0 {
+				// We've encountered the first owner-drawn item in the menu. Obtain
+				// shared metrics from the window theme.
+				sm = window.AsWindowBase().menuSharedMetrics()
+			}
+			action.ownerDrawInfo.sharedMetrics = sm
+			action.ownerDrawInfo.perMenuMetrics = &m.perMenuMetrics
+			numOwnerDraw++
+			fallthrough
+		case action.image != nil:
 			m.onActionChanged(action)
 		}
+
 		if action.menu != nil {
-			action.menu.updateItemsWithImageForWindow(window)
+			action.menu.updateItemsForWindow(window)
 		}
+	}
+
+	if numOwnerDraw > 0 && (needAccelSpace || numOwnerDraw < len(m.actions.actions)) {
+		// If we need accelerator space, then we need to measure each item's
+		// shortcut text.
+		// If we have any owner-drawn items, any remaining actions that are not
+		// owner-drawn must be set to owner-drawn via DefaultActionOwnerDrawHandler.
+		// Failure to do so would result in non-owner-drawn items being rendered
+		// without any theming whatsoever.
+		m.actions.forEach(func(a *Action) bool {
+			if needAccelSpace {
+				defer m.perMenuMetrics.measureAccelTextExtent(m.window, a)
+			}
+			if a.OwnerDraw() {
+				return true
+			}
+			a.ownerDrawInfo = newOwnerDrawnMenuItemInfo(a, DefaultActionOwnerDrawHandler)
+			a.ownerDrawInfo.sharedMetrics = sm
+			a.ownerDrawInfo.perMenuMetrics = &m.perMenuMetrics
+			m.onActionChanged(a)
+			return true
+		})
+	}
+}
+
+func (m *Menu) resolveDPI() int {
+	switch {
+	case m.getDPI != nil:
+		return m.getDPI()
+	case m.window != nil:
+		return m.window.DPI()
+	default:
+		return screenDPI()
 	}
 }
 
 func (m *Menu) initMenuItemInfoFromAction(mii *win.MENUITEMINFO, action *Action) {
 	mii.CbSize = uint32(unsafe.Sizeof(*mii))
-	mii.FMask = win.MIIM_FTYPE | win.MIIM_ID | win.MIIM_STATE | win.MIIM_STRING
-	if action.image != nil {
-		mii.FMask |= win.MIIM_BITMAP
-		dpi := 96
-		if m.getDPI != nil {
-			dpi = m.getDPI()
-		} else if m.window != nil {
-			dpi = m.window.DPI()
-		} else {
-			dpi = screenDPI()
+	mii.FMask = win.MIIM_FTYPE | win.MIIM_ID | win.MIIM_STATE | win.MIIM_DATA
+	mii.FType = 0
+	mii.DwItemData = 0
+
+	setString := true
+
+	switch {
+	case action.ownerDrawInfo != nil:
+		mii.FType |= win.MFT_OWNERDRAW
+		if m.allowOwnerDrawInvalidation {
+			// Terrible hack: owner-drawn items won't be asked to recompute their sizes
+			// without specifying win.MIIM_BITMAP with a zero HbmpItem!
+			mii.FMask |= win.MIIM_BITMAP
+			mii.HbmpItem = 0
 		}
+		// Setting DwItemData to the pointer to our ownerDrawInfo enables
+		// (*WindowBase).WndProc to quickly resolve the menu item being drawn.
+		mii.DwItemData = uintptr(unsafe.Pointer(action.ownerDrawInfo))
+		setString = false
+	case action.image != nil:
+		mii.FMask |= win.MIIM_BITMAP
+		dpi := m.resolveDPI()
 		if bmp, err := iconCache.Bitmap(action.image, dpi); err == nil {
 			mii.HbmpItem = bmp.hBmp
 		}
-	}
-	if action.IsSeparator() {
+	case action.IsSeparator():
 		mii.FType |= win.MFT_SEPARATOR
-	} else {
-		mii.FType |= win.MFT_STRING
+		setString = false
+	default:
+	}
+
+	if setString {
+		mii.FMask |= win.MIIM_STRING
 		var text string
 		if s := action.shortcut; s.Key != 0 {
 			text = fmt.Sprintf("%s\t%s", action.text, s.String())
@@ -127,8 +254,8 @@ func (m *Menu) initMenuItemInfoFromAction(mii *win.MENUITEMINFO, action *Action)
 			text = action.text
 		}
 		mii.DwTypeData = syscall.StringToUTF16Ptr(text)
-		mii.Cch = uint32(len([]rune(action.text)))
 	}
+
 	mii.WID = uint32(action.id)
 
 	if action.Enabled() {
@@ -137,9 +264,6 @@ func (m *Menu) initMenuItemInfoFromAction(mii *win.MENUITEMINFO, action *Action)
 		mii.FState |= win.MFS_DISABLED
 	}
 
-	if action.Checkable() {
-		mii.FMask |= win.MIIM_CHECKMARKS
-	}
 	if action.Checked() {
 		mii.FState |= win.MFS_CHECKED
 	}
@@ -167,6 +291,8 @@ func (m *Menu) handleDefaultState(action *Action) {
 }
 
 func (m *Menu) onActionChanged(action *Action) error {
+	defer m.ensureMenuBarRedrawn()
+
 	m.handleDefaultState(action)
 
 	if !action.Visible() {
@@ -185,27 +311,18 @@ func (m *Menu) onActionChanged(action *Action) error {
 		win.SetMenuDefaultItem(m.hMenu, uint32(m.actions.indexInObserver(action)), true)
 	}
 
-	if action.Exclusive() && action.Checked() {
-		var first, last int
-
-		index := m.actions.Index(action)
-
-		for i := index; i >= 0; i-- {
-			first = i
-			if !m.actions.At(i).Exclusive() {
-				break
-			}
-		}
-
-		for i := index; i < m.actions.Len(); i++ {
-			last = i
-			if !m.actions.At(i).Exclusive() {
-				break
-			}
+	if action.Checked() && action.Exclusive() {
+		first, last, index, err := m.actions.positionsForExclusiveCheck(action)
+		if err != nil {
+			return err
 		}
 
 		if !win.CheckMenuRadioItem(m.hMenu, uint32(first), uint32(last), uint32(index), win.MF_BYPOSITION) {
 			return newError("CheckMenuRadioItem failed")
+		}
+
+		if err := m.actions.uncheckActionsForExclusiveCheck(first, last, index); err != nil {
+			return err
 		}
 	}
 
@@ -282,7 +399,7 @@ func (m *Menu) removeAction(action *Action, visibleChanged bool) error {
 
 func (m *Menu) ensureMenuBarRedrawn() {
 	if m.window != nil {
-		if mw, ok := m.window.(*MainWindow); ok && mw != nil {
+		if mw, ok := m.window.(*MainWindow); ok && mw.menu == m {
 			win.DrawMenuBar(mw.Handle())
 		}
 	}
@@ -306,4 +423,24 @@ func (m *Menu) onClearingActions() error {
 	}
 
 	return nil
+}
+
+// onMnemonic is called when m contains owner-drawn items and its parent Window
+// receives a keypress. It enumerates all visible menu items, and if a match is
+// found, it returns an action code telling Windows to execute the item specifed
+// by positional index.
+func (m *Menu) onMnemonic(key Key) (index, action uint16) {
+	m.actions.forEachVisible(func(a *Action) bool {
+		if odi := a.ownerDrawInfo; odi != nil {
+			if aKey := odi.mnemonic; aKey != 0 && aKey == key {
+				action = win.MNC_EXECUTE
+				return false
+			}
+		}
+
+		index++
+		return true
+	})
+
+	return index, action
 }

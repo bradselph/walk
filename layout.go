@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build windows
 // +build windows
 
 package walk
@@ -9,7 +10,7 @@ package walk
 import (
 	"sync"
 
-	"github.com/lxn/win"
+	"github.com/tailscale/win"
 )
 
 func createLayoutItemForWidget(widget Widget) LayoutItem {
@@ -136,7 +137,7 @@ func startLayoutPerformer(form Form) (performLayout chan ContainerLayoutItem, la
 				if sizing {
 					layoutResults <- results
 				} else {
-					form.AsFormBase().synchronizeLayout(&formLayoutResult{form, stopwatch, results})
+					App().synchronizeLayout(&formLayoutResult{form, stopwatch, results})
 				}
 
 			case sizing = <-inSizeLoop:

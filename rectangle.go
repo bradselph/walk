@@ -2,12 +2,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build windows
 // +build windows
 
 package walk
 
 import (
-	"github.com/lxn/win"
+	"github.com/tailscale/win"
 )
 
 // Rectangle defines upper left corner with width and height region in 1/96" units, or native
@@ -18,6 +19,11 @@ type Rectangle struct {
 
 func (r Rectangle) IsZero() bool {
 	return r.X == 0 && r.Y == 0 && r.Width == 0 && r.Height == 0
+}
+
+// RectangleFromRECT converts r from a win.RECT to a Rectangle.
+func RectangleFromRECT(r win.RECT) Rectangle {
+	return rectangleFromRECT(r)
 }
 
 func rectangleFromRECT(r win.RECT) Rectangle {

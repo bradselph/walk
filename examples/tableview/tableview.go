@@ -6,15 +6,15 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"math/rand"
 	"sort"
 	"strings"
 	"time"
-)
 
-import (
-	"github.com/lxn/walk"
-	. "github.com/lxn/walk/declarative"
+	"github.com/tailscale/walk"
+
+	. "github.com/tailscale/walk/declarative"
 )
 
 type Foo struct {
@@ -135,6 +135,11 @@ func (m *FooModel) ResetRows() {
 }
 
 func main() {
+	app, err := walk.InitApp()
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	rand.Seed(time.Now().UnixNano())
 
 	boldFont, _ := walk.NewFont("Segoe UI", 9, walk.FontBold)
@@ -235,5 +240,7 @@ func main() {
 				},
 			},
 		},
-	}.Run()
+	}.Create()
+
+	app.Run()
 }

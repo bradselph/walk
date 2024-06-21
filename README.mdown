@@ -5,6 +5,11 @@ Walk is a "Windows Application Library Kit" for the Go Programming Language.
 
 Its primarily useful for Desktop GUI development, but there is some more stuff.
 
+Fork from original module
+=========================
+
+This is a fork from the [original module](https://github.com/lxn/walk).
+
 Setup
 =====
 
@@ -12,13 +17,15 @@ Make sure you have a working Go installation.
 See [Getting Started](http://golang.org/doc/install.html)
 
 ##### Note
-Walk currently requires Go 1.11.x or later.
+Walk currently requires Go 1.21 or later.
 
 ##### To Install
-Now run `go get github.com/lxn/walk`
+Now run `go get github.com/tailscale/walk`
 
 Using Walk
 ==========
+
+A Walk application must always begin with a call to `walk.InitApp()`.
 
 The preferred way to create GUIs with Walk is to use its declarative sub package,
 as illustrated in this small example:
@@ -29,12 +36,19 @@ as illustrated in this small example:
 package main
 
 import (
-	"github.com/lxn/walk"
-	. "github.com/lxn/walk/declarative"
+	"log"
 	"strings"
+
+	"github.com/tailscale/walk"
+	. "github.com/tailscale/walk/declarative"
 )
 
 func main() {
+	app, err := walk.InitApp()
+		if err != nil {
+		log.Fatal(err)
+	}
+
 	var inTE, outTE *walk.TextEdit
 
 	MainWindow{
@@ -55,7 +69,9 @@ func main() {
 				},
 			},
 		},
-	}.Run()
+	}.Create()
+
+	app.Run()
 }
 ```
 
@@ -122,12 +138,3 @@ your executable before the manifest file is in place.
 If you do anyway, the program will not run properly. And worse, Windows will not
 recognize a manifest file, you later drop next to the executable. To fix this,
 rebuild your executable and only launch it with a manifest file in place.
-
-CGo Optimizations
-=================
-
-The usual default message loop includes calls to win32 API functions, which incurs a decent amount
-of runtime overhead coming from Go. As an alternative to this, you may compile Walk using an
-optional C implementation of the main message loop, by passing the `walk_use_cgo` build tag:
-
-   go build -tags walk_use_cgo

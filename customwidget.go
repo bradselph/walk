@@ -9,7 +9,7 @@ package walk
 import (
 	"unsafe"
 
-	"github.com/lxn/win"
+	"github.com/tailscale/win"
 )
 
 const customWidgetWindowClass = `\o/ Walk_CustomWidget_Class \o/`
@@ -190,7 +190,7 @@ func (cw *CustomWidget) bufferedPaint(canvas *Canvas, updateBounds Rectangle) er
 	}
 	defer win.DeleteDC(hdc)
 
-	buffered := Canvas{hdc: hdc, doNotDispose: true}
+	buffered := Canvas{hdc: hdc, doNotDisposeDC: true}
 	if _, err := buffered.init(); err != nil {
 		return err
 	}

@@ -7,14 +7,18 @@ package main
 import (
 	"log"
 	"time"
-)
 
-import (
-	"github.com/lxn/walk"
-	. "github.com/lxn/walk/declarative"
+	"github.com/tailscale/walk"
+
+	. "github.com/tailscale/walk/declarative"
 )
 
 func main() {
+	app, err := walk.InitApp()
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	var mw *walk.MainWindow
 
 	if err := (MainWindow{
@@ -42,5 +46,5 @@ func main() {
 		}
 	}()
 
-	mw.Run()
+	app.Run()
 }

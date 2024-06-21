@@ -2,12 +2,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build windows
 // +build windows
 
 package declarative
 
 import (
-	"github.com/lxn/walk"
+	"github.com/tailscale/walk"
 )
 
 type Dialog struct {
@@ -166,18 +167,4 @@ func (d Dialog) Create(owner walk.Form) error {
 
 		return nil
 	})
-}
-
-func (d Dialog) Run(owner walk.Form) (int, error) {
-	var w *walk.Dialog
-
-	if d.AssignTo == nil {
-		d.AssignTo = &w
-	}
-
-	if err := d.Create(owner); err != nil {
-		return 0, err
-	}
-
-	return (*d.AssignTo).Run(), nil
 }

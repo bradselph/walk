@@ -2,22 +2,34 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build windows
 // +build windows
 
 package walk
+
+import (
+	"runtime"
+
+	"github.com/tailscale/walk/idalloc"
+	"github.com/tailscale/win"
+)
 
 type actionChangedHandler interface {
 	onActionChanged(action *Action) error
 	onActionVisibleChanged(action *Action) error
 }
 
+// ActionOwnerDrawHandler must be implemented by any struct that wants to
+// provide measurement and drawing for owner-drawn menu items.
+type ActionOwnerDrawHandler interface {
+	OnMeasure(action *Action, mctx *MenuItemMeasureContext) (widthPixels, heightPixels uint32)
+	OnDraw(action *Action, dctx *MenuItemDrawContext)
+}
+
 var (
-	// ISSUE: When pressing enter resp. escape,
-	// WM_COMMAND with wParam=1 resp. 2 is sent.
-	// Maybe there is more to consider.
-	nextActionId    uint16 = 3
-	actionsById            = make(map[uint16]*Action)
-	shortcut2Action        = make(map[Shortcut]*Action)
+	actionIDs       = makeIDAllocator()
+	actionsById     = make(map[uint16]*Action)
+	shortcut2Action = make(map[Shortcut]*Action)
 )
 
 type Action struct {
@@ -44,54 +56,102 @@ type Action struct {
 	defawlt                       bool
 	exclusive                     bool
 	id                            uint16
+	ownerDrawInfo                 *ownerDrawnMenuItemInfo
+}
+
+// aaron: I don't know why Walk uses menu item IDs for IDOK and IDCANCEL, but
+// for now we need to reserve IDs up to and including IDCANCEL (2).
+const maxReservedID = win.IDCANCEL
+
+func makeIDAllocator() idalloc.IDAllocator {
+	alloc := idalloc.New(1 << 16)
+	for i := 0; i <= maxReservedID; i++ {
+		alloc.Allocate()
+	}
+	return alloc
+}
+
+func allocActionID() uint16 {
+	id, err := actionIDs.Allocate()
+	if err != nil {
+		panic(err)
+	}
+	return uint16(id)
+}
+
+func freeActionID(id uint16) {
+	if id <= maxReservedID {
+		return
+	}
+	actionIDs.Free(uint32(id))
 }
 
 func NewAction() *Action {
 	a := &Action{
 		enabled: true,
-		id:      nextActionId,
+		id:      allocActionID(),
 		visible: true,
 	}
-
-	actionsById[a.id] = a
-
-	nextActionId++
-
+	runtime.SetFinalizer(a, (*Action).finalize)
 	return a
 }
 
 func NewMenuAction(menu *Menu) *Action {
 	a := NewAction()
 	a.menu = menu
-
 	return a
 }
 
 func NewSeparatorAction() *Action {
-	return &Action{
+	a := &Action{
 		enabled: true,
 		visible: true,
 	}
+	runtime.SetFinalizer(a, (*Action).finalize)
+	return a
+}
+
+func (a *Action) Dispose() {
+	a.SetEnabledCondition(nil)
+	a.SetVisibleCondition(nil)
+
+	if a.menu != nil {
+		a.menu.actions.Clear()
+		a.menu.Dispose()
+	}
+
+	if a.ownerDrawInfo != nil {
+		a.ownerDrawInfo.Dispose()
+		a.ownerDrawInfo = nil
+	}
+}
+
+func (a *Action) finalize() {
+	if app := App(); !app.IsUIThread() {
+		app.Synchronize(a.finalize)
+		return
+	}
+	a.Dispose()
+	freeActionID(a.id)
 }
 
 func (a *Action) addRef() {
 	a.refCount++
+	if a.refCount == 1 {
+		actionsById[a.id] = a
+		if sc := a.shortcut; sc.Key != 0 {
+			shortcut2Action[sc] = a
+		}
+	}
 }
 
 func (a *Action) release() {
 	a.refCount--
-
 	if a.refCount == 0 {
-		a.SetEnabledCondition(nil)
-		a.SetVisibleCondition(nil)
-
-		if a.menu != nil {
-			a.menu.actions.Clear()
-			a.menu.Dispose()
-		}
-
 		delete(actionsById, a.id)
-		delete(shortcut2Action, a.shortcut)
+		if sc := a.shortcut; sc.Key != 0 && shortcut2Action[sc] == a {
+			delete(shortcut2Action, sc)
+		}
 	}
 }
 
@@ -256,6 +316,7 @@ func (a *Action) EnabledCondition() Condition {
 }
 
 func (a *Action) SetEnabledCondition(c Condition) {
+	prev := a.enabledCondition
 	if a.enabledCondition != nil {
 		a.enabledCondition.Changed().Detach(a.enabledConditionChangedHandle)
 	}
@@ -274,7 +335,9 @@ func (a *Action) SetEnabledCondition(c Condition) {
 		})
 	}
 
-	a.raiseChanged()
+	if prev != c {
+		a.raiseChanged()
+	}
 }
 
 func (a *Action) Exclusive() bool {
@@ -330,19 +393,23 @@ func (a *Action) SetShortcut(shortcut Shortcut) (err error) {
 			}
 		}()
 
-		if err = a.raiseChanged(); err != nil {
+		if err := a.raiseChanged(); err != nil {
 			a.shortcut = old
 			a.raiseChanged()
-		} else {
+			return err
+		}
+
+		if a.refCount > 0 {
 			if shortcut.Key == 0 {
-				delete(shortcut2Action, old)
+				if shortcut2Action[old] == a {
+					delete(shortcut2Action, old)
+				}
 			} else {
 				shortcut2Action[shortcut] = a
 			}
 		}
 	}
-
-	return
+	return nil
 }
 
 func (a *Action) Text() string {
@@ -387,6 +454,44 @@ func (a *Action) SetToolTip(value string) (err error) {
 	return
 }
 
+// SetOwnerDraw converts a into an owner-drawn action whose measurement and
+// drawing is carried out by handler.
+func (a *Action) SetOwnerDraw(handler ActionOwnerDrawHandler) (err error) {
+	if a.ownerDrawInfo == nil && handler == nil {
+		// No change
+		return
+	}
+
+	if a.ownerDrawInfo != nil && a.ownerDrawInfo.handler == handler {
+		// No change
+		return
+	}
+
+	old := a.ownerDrawInfo
+	defer func() {
+		if old != nil {
+			old.Dispose()
+		}
+	}()
+	if handler != nil {
+		a.ownerDrawInfo = newOwnerDrawnMenuItemInfo(a, handler)
+	} else {
+		a.ownerDrawInfo = nil
+	}
+
+	if err = a.raiseChanged(); err != nil {
+		a.ownerDrawInfo, old = old, a.ownerDrawInfo
+		a.raiseChanged()
+	}
+
+	return
+}
+
+// OwnerDraw returns true when a has a handler registered for owner drawing.
+func (a *Action) OwnerDraw() bool {
+	return a.ownerDrawInfo != nil
+}
+
 func (a *Action) Visible() bool {
 	return a.visible
 }
@@ -415,6 +520,7 @@ func (a *Action) VisibleCondition() Condition {
 }
 
 func (a *Action) SetVisibleCondition(c Condition) {
+	prev := a.visibleCondition
 	if a.visibleCondition != nil {
 		a.visibleCondition.Changed().Detach(a.visibleConditionChangedHandle)
 	}
@@ -433,7 +539,9 @@ func (a *Action) SetVisibleCondition(c Condition) {
 		})
 	}
 
-	a.raiseChanged()
+	if prev != c {
+		a.raiseChanged()
+	}
 }
 
 func (a *Action) Triggered() *Event {
@@ -442,7 +550,7 @@ func (a *Action) Triggered() *Event {
 
 func (a *Action) raiseTriggered() {
 	if a.Checkable() {
-		a.SetChecked(!a.Checked())
+		a.SetChecked(a.Exclusive() || !a.Checked())
 	}
 
 	a.triggeredPublisher.Publish()

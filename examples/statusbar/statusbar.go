@@ -10,11 +10,16 @@ package main
 import (
 	"log"
 
-	"github.com/lxn/walk"
-	. "github.com/lxn/walk/declarative"
+	"github.com/tailscale/walk"
+	. "github.com/tailscale/walk/declarative"
 )
 
 func main() {
+	app, err := walk.InitApp()
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	icon1, err := walk.NewIconFromFile("../img/check.ico")
 	if err != nil {
 		log.Fatal(err)
@@ -61,5 +66,7 @@ func main() {
 				ToolTipText: "An icon with a tooltip",
 			},
 		},
-	}.Run()
+	}.Create()
+
+	app.Run()
 }
